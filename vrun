@@ -1,0 +1,770 @@
+#!/bin/bash
+# vrun — Vite project launcher with interactive project management.
+# Run 'vrun --help' for the full manual.
+set -eo pipefail
+
+# ── Colors ──────────────────────────────────────────────────────────────────
+BRED='\033[1;31m'
+BGREEN='\033[1;32m'
+BYELLOW='\033[1;33m'
+BCYAN='\033[1;36m'
+BWHITE='\033[1;37m'
+BOLD='\033[1m'
+GRAY='\033[0;90m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+TAG_COLORS=(
+    '\033[1;36m'   # bold cyan
+    '\033[1;32m'   # bold green
+    '\033[1;35m'   # bold magenta
+    '\033[1;33m'   # bold yellow
+    '\033[1;34m'   # bold blue
+)
+
+# ── Config ───────────────────────────────────────────────────────────────────
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vrun"
+CONFIG_FILE="$CONFIG_DIR/config"
+BASE_PORT=5173
+
+# ── State ────────────────────────────────────────────────────────────────────
+KNOWN_ALIASES=()
+KNOWN_PATHS=()
+PIDS=()
+VALID_ALIASES=()
+LAUNCH_PORTS=()
+LAUNCH_COLORS=()
+CLEANUP_DONE=0
+MULTI=0
+MAX_ALIAS_LEN=0
+LAST_ADDED_ALIAS=""
+
+# ── Layout ───────────────────────────────────────────────────────────────────
+LINE=$(printf  '─%.0s' {1..70})
+ELINE=$(printf '═%.0s' {1..70})
+
+# ════════════════════════════════════════════════════════════════════════════
+# Config I/O
+# ════════════════════════════════════════════════════════════════════════════
+
+load_projects() {
+    KNOWN_ALIASES=()
+    KNOWN_PATHS=()
+    [[ ! -f "$CONFIG_FILE" ]] && return
+    while IFS='=' read -r key val; do
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${key// /}"           ]] && continue
+        KNOWN_ALIASES+=("$key")
+        KNOWN_PATHS+=("$val")
+    done < "$CONFIG_FILE"
+}
+
+save_projects() {
+    mkdir -p "$CONFIG_DIR"
+    local tmp
+    tmp="$(mktemp "$CONFIG_DIR/.projects.XXXXXX")"
+    {
+        printf "# vrun projects — alias=path\n"
+        printf "# Manage with:  vrun add  /  vrun rm <alias>\n"
+        printf "#\n"
+        for i in "${!KNOWN_ALIASES[@]}"; do
+            printf "%s=%s\n" "${KNOWN_ALIASES[$i]}" "${KNOWN_PATHS[$i]}"
+        done
+    } > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+get_project_path() {
+    local target="$1"
+    for i in "${!KNOWN_ALIASES[@]}"; do
+        [[ "${KNOWN_ALIASES[$i]}" == "$target" ]] && echo "${KNOWN_PATHS[$i]}" && return
+    done
+    echo ""
+}
+
+is_known_alias() {
+    local target="$1"
+    for a in "${KNOWN_ALIASES[@]}"; do [[ "$a" == "$target" ]] && return 0; done
+    return 1
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Port helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+port_in_use() {
+    command -v lsof &>/dev/null && lsof -iTCP:"$1" -sTCP:LISTEN &>/dev/null || return 1
+}
+
+next_free_port() {
+    local port=$1
+    while port_in_use "$port"; do
+        echo -e "  ${BYELLOW}⚠  Port ${port} in use, trying $((port+1))…${RESET}" >&2
+        port=$((port + 1))
+    done
+    echo "$port"
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# UI
+# ════════════════════════════════════════════════════════════════════════════
+
+print_header() {
+    local title="vrun  ·  Vite Launcher"
+    local inner=70
+    local pad_l=$(( (inner - ${#title}) / 2 ))
+    local pad_r=$(( inner - ${#title} - pad_l ))
+    echo
+    echo -e "${BCYAN}╔${ELINE}╗${RESET}"
+    echo -e "${BCYAN}║${RESET}$(printf '%*s' $pad_l '')${BWHITE}${title}${RESET}$(printf '%*s' $pad_r '')${BCYAN}║${RESET}"
+    echo -e "${BCYAN}╚${ELINE}╝${RESET}"
+    echo
+}
+
+print_divider() { echo -e "${GRAY}${LINE}${RESET}"; }
+
+print_commands_bar() {
+    print_divider
+    echo -e "  ${DIM}s · stop   rs · restart all   r <alias>   run <alias>   add   rm <alias>   ls · list   h · help${RESET}"
+    print_divider
+}
+
+print_manual() {
+    echo
+    echo -e "${BWHITE}NAME${RESET}"
+    echo    "      vrun — launch and manage multiple Vite dev servers"
+    echo
+    echo -e "${BWHITE}SYNOPSIS${RESET}"
+    echo -e "      ${BOLD}vrun${RESET} [${DIM}alias …${RESET}]           start one or more dev servers"
+    echo -e "      ${BOLD}vrun add${RESET}                add a project interactively"
+    echo -e "      ${BOLD}vrun rm${RESET} ${DIM}<alias>${RESET}           remove a configured project"
+    echo -e "      ${BOLD}vrun ls${RESET}                 list all configured projects"
+    echo -e "      ${BOLD}vrun --help${RESET}             show this manual"
+    echo
+    echo -e "${BWHITE}DESCRIPTION${RESET}"
+    echo    "      vrun starts Vite dev servers by short alias names."
+    echo    "      Aliases and their project paths are stored in a config"
+    echo    "      file and managed with the add / rm subcommands."
+    echo
+    echo    "      Single alias: Vite uses its default port (5173)."
+    echo    "      Multiple aliases: ports are assigned sequentially from"
+    echo    "      5173, skipping any already in use."
+    echo
+    echo    "      All server output is streamed live with per-project"
+    echo    "      colour-coded prefixes so you can tell projects apart."
+    echo
+    echo    "      While servers are running, use 'run <alias>' to launch"
+    echo    "      additional configured projects mid-session without restarting."
+    echo
+    echo -e "${BWHITE}INTERACTIVE COMMANDS${RESET}"
+    echo    "      While servers are running, type a command + Enter:"
+    echo
+    printf  "      ${BGREEN}%-22s${RESET}  %s\n" "s  ·  stop"      "stop all servers and exit"
+    printf  "      ${BGREEN}%-22s${RESET}  %s\n" "rs  ·  restart"  "restart all running servers"
+    printf  "      ${BGREEN}%-22s${RESET}  %s\n" "r <alias>"       "restart a specific server"
+    printf  "      ${BGREEN}%-22s${RESET}  %s\n" "run <alias>"     "start a configured project in this session"
+    printf  "      ${BGREEN}%-22s${RESET}  %s\n" "add"             "add a project to config and optionally launch it"
+    printf  "      ${BGREEN}%-22s${RESET}  %s\n" "rm <alias>"      "remove a project from config"
+    printf  "      ${BGREEN}%-22s${RESET}  %s\n" "ls  ·  list"     "show running server statuses"
+    printf  "      ${BGREEN}%-22s${RESET}  %s\n" "h  ·  help"      "show the command reference"
+    echo
+    echo    "      Ctrl+C stops all servers gracefully."
+    echo
+    echo -e "${BWHITE}CONFIGURATION${RESET}"
+    echo    "      Projects are stored in:"
+    echo -e "        ${DIM}${CONFIG_FILE}${RESET}"
+    echo
+    echo    "      Format — one project per line:"
+    echo -e "        ${DIM}alias=/absolute/path/to/project${RESET}"
+    echo
+    echo    "      Lines starting with # are comments. Edit the file"
+    echo    "      directly or use 'vrun add' / 'vrun rm'."
+    echo
+    echo -e "${BWHITE}EXAMPLES${RESET}"
+    echo -e "      ${DIM}# Start a single project (Vite default port 5173)${RESET}"
+    echo    "      vrun innoflow"
+    echo
+    echo -e "      ${DIM}# Start multiple projects with sequential ports${RESET}"
+    echo    "      vrun innoflow approval innofleet"
+    echo
+    echo -e "      ${DIM}# Manage projects${RESET}"
+    echo    "      vrun add"
+    echo    "      vrun rm innoflow"
+    echo    "      vrun ls"
+    echo
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Project management
+# ════════════════════════════════════════════════════════════════════════════
+
+_read_alias_input() {
+    # Prompts for a project alias; result in INPUT_ALIAS.
+    local existing_path
+    while true; do
+        printf "  ${BOLD}%-24s${RESET}" "Alias:"
+        IFS= read -r INPUT_ALIAS < /dev/tty
+        INPUT_ALIAS="$(echo "$INPUT_ALIAS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+        [[ -z "$INPUT_ALIAS" ]] \
+            && echo -e "  ${BRED}✗  Alias cannot be empty.${RESET}" && continue
+
+        if [[ "$INPUT_ALIAS" =~ [[:space:]=] ]]; then
+            echo -e "  ${BRED}✗  Alias cannot contain spaces or '='.${RESET}"
+            continue
+        fi
+
+        existing_path=$(get_project_path "$INPUT_ALIAS")
+        if [[ -n "$existing_path" ]]; then
+            echo -e "  ${BYELLOW}⚠  \"${INPUT_ALIAS}\" already exists:${RESET}"
+            echo -e "     ${DIM}${existing_path}${RESET}"
+            printf "  Overwrite? [y/N]: "
+            local confirm; IFS= read -r confirm < /dev/tty
+            [[ "$confirm" != "y" && "$confirm" != "Y" ]] && continue
+        fi
+        break
+    done
+}
+
+_read_path_input() {
+    # Prompts for a project directory path; result in INPUT_PATH.
+    while true; do
+        printf "  ${BOLD}%-24s${RESET}" "Path to project:"
+        IFS= read -r INPUT_PATH < /dev/tty
+        INPUT_PATH="$(echo "$INPUT_PATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        INPUT_PATH="${INPUT_PATH/#\~/$HOME}"   # expand leading ~
+
+        [[ -z "$INPUT_PATH" ]] \
+            && echo -e "  ${BRED}✗  Path cannot be empty.${RESET}" && continue
+
+        if [[ ! -d "$INPUT_PATH" ]]; then
+            echo -e "  ${BYELLOW}⚠  Directory does not exist: ${DIM}${INPUT_PATH}${RESET}"
+            printf "  Add anyway? [y/N]: "
+            local confirm; IFS= read -r confirm < /dev/tty
+            [[ "$confirm" != "y" && "$confirm" != "Y" ]] && continue
+        fi
+        break
+    done
+}
+
+cmd_add_project() {
+    echo
+    print_divider
+    echo -e "  ${BOLD}Add a project${RESET}"
+    echo
+
+    _read_alias_input
+    local new_alias="$INPUT_ALIAS"
+
+    _read_path_input
+    local new_path="$INPUT_PATH"
+
+    # Overwrite if alias exists, otherwise append
+    local found=0
+    for i in "${!KNOWN_ALIASES[@]}"; do
+        if [[ "${KNOWN_ALIASES[$i]}" == "$new_alias" ]]; then
+            KNOWN_PATHS[$i]="$new_path"; found=1; break
+        fi
+    done
+    [[ $found -eq 0 ]] && KNOWN_ALIASES+=("$new_alias") && KNOWN_PATHS+=("$new_path")
+    save_projects
+
+    echo
+    echo -e "  ${BGREEN}✔${RESET}  ${BOLD}${new_alias}${RESET}  →  ${DIM}${new_path}${RESET}"
+    print_divider
+    echo
+    LAST_ADDED_ALIAS="$new_alias"
+}
+
+cmd_remove_project() {
+    local target
+    target="$(echo "${1:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+    if [[ -z "$target" ]]; then
+        echo -e "  ${BYELLOW}⚠  Usage: rm <alias>${RESET}"
+        return
+    fi
+
+    if ! is_known_alias "$target"; then
+        echo -e "  ${BRED}✗  Project not found: \"${target}\"${RESET}"
+        if [[ ${#KNOWN_ALIASES[@]} -gt 0 ]]; then
+            echo -e "  ${DIM}Configured: ${KNOWN_ALIASES[*]}${RESET}"
+        fi
+        return
+    fi
+
+    # Warn if currently running in this session
+    for a in "${VALID_ALIASES[@]:-}"; do
+        if [[ "$a" == "$target" ]]; then
+            echo -e "  ${BYELLOW}⚠  \"${target}\" is currently running in this session.${RESET}"
+            echo -e "  ${DIM}The server will keep running; only the config entry is removed.${RESET}"
+            break
+        fi
+    done
+
+    local new_aliases=() new_paths=()
+    for i in "${!KNOWN_ALIASES[@]}"; do
+        if [[ "${KNOWN_ALIASES[$i]}" != "$target" ]]; then
+            new_aliases+=("${KNOWN_ALIASES[$i]}")
+            new_paths+=("${KNOWN_PATHS[$i]}")
+        fi
+    done
+
+    if [[ ${#new_aliases[@]} -gt 0 ]]; then
+        KNOWN_ALIASES=("${new_aliases[@]}")
+        KNOWN_PATHS=("${new_paths[@]}")
+    else
+        KNOWN_ALIASES=()
+        KNOWN_PATHS=()
+    fi
+    save_projects
+
+    echo -e "  ${BGREEN}✔${RESET}  Removed ${BOLD}\"${target}\"${RESET} from config."
+}
+
+cmd_list_all_projects() {
+    if [[ ${#KNOWN_ALIASES[@]} -eq 0 ]]; then
+        echo -e "  ${DIM}No projects configured. Run 'vrun add' to get started.${RESET}"
+        echo
+        return
+    fi
+
+    echo -e "  ${BOLD}Configured projects${RESET}  ${GRAY}${CONFIG_FILE}${RESET}"
+    echo
+
+    local i=0
+    for idx in "${!KNOWN_ALIASES[@]}"; do
+        local color="${TAG_COLORS[$((i % ${#TAG_COLORS[@]}))]}"
+        local alias="${KNOWN_ALIASES[$idx]}"
+        local path="${KNOWN_PATHS[$idx]}"
+        local flag=""
+        [[ ! -d "$path" ]] && flag="  ${BRED}[dir not found]${RESET}"
+        printf "  ${color}◆${RESET}  ${BOLD}%-22s${RESET}  ${DIM}%s${RESET}%b\n" "$alias" "$path" "$flag"
+        i=$((i + 1))
+    done
+    echo
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Server management
+# ════════════════════════════════════════════════════════════════════════════
+
+launch_server() {
+    local alias="$1" port="$2" color="$3"
+    local path fmt_len
+    path=$(get_project_path "$alias")
+    fmt_len=$MAX_ALIAS_LEN
+
+    if [[ -n "$port" ]]; then
+        (cd "$path" && npm run dev -- --port="$port" 2>&1 \
+            | while IFS= read -r line; do
+                printf "  ${color}[%-${fmt_len}s]${RESET}  %s\n" "$alias" "$line"
+              done) &
+    else
+        (cd "$path" && npm run dev 2>&1 \
+            | while IFS= read -r line; do
+                printf "  ${color}[%-${fmt_len}s]${RESET}  %s\n" "$alias" "$line"
+              done) &
+    fi
+}
+
+kill_server() {
+    local pid="$1"
+    kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Interactive commands
+# ════════════════════════════════════════════════════════════════════════════
+
+cmd_stop() {
+    CLEANUP_DONE=1
+    echo; print_divider
+    echo -e "  ${BYELLOW}⚠  Stopping all servers…${RESET}"
+    for pid in "${PIDS[@]}"; do kill_server "$pid"; done
+    PIDS=()
+    echo -e "  ${GRAY}All servers stopped.${RESET}"
+    print_divider; echo
+}
+
+cmd_restart_all() {
+    echo; print_divider
+    echo -e "  ${BCYAN}↺  Restarting all servers…${RESET}"
+    for pid in "${PIDS[@]}"; do kill_server "$pid"; done
+    PIDS=()
+    echo -e "  ${GRAY}Stopped. Relaunching…${RESET}"
+    print_divider; echo
+    for i in "${!VALID_ALIASES[@]}"; do
+        launch_server "${VALID_ALIASES[$i]}" "${LAUNCH_PORTS[$i]}" "${LAUNCH_COLORS[$i]}"
+        PIDS[$i]=$!
+    done
+    print_commands_bar; echo
+}
+
+cmd_restart_one() {
+    local target
+    target="$(echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "$target" ]] \
+        && echo -e "  ${BYELLOW}⚠  Usage: r <alias>  (e.g. r innoflow)${RESET}" && return
+
+    local found=0
+    for i in "${!VALID_ALIASES[@]}"; do
+        if [[ "${VALID_ALIASES[$i]}" == "$target" ]]; then
+            found=1
+            local color="${LAUNCH_COLORS[$i]}"
+            echo; print_divider
+            echo -e "  ${color}↺${RESET}  Restarting ${BOLD}${target}${RESET}…"
+            kill_server "${PIDS[$i]}"
+            echo -e "  ${GRAY}Stopped. Relaunching…${RESET}"
+            print_divider; echo
+            launch_server "$target" "${LAUNCH_PORTS[$i]}" "${LAUNCH_COLORS[$i]}"
+            PIDS[$i]=$!
+            break
+        fi
+    done
+    if [[ $found -eq 0 ]]; then
+        echo -e "  ${BRED}✗  Not in this session: \"${target}\"${RESET}"
+        echo -e "  ${DIM}Running: ${VALID_ALIASES[*]}${RESET}"
+    fi
+}
+
+cmd_run_project() {
+    local target
+    target="$(echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+    if [[ -z "$target" ]]; then
+        echo -e "  ${BYELLOW}⚠  Usage: run <alias>${RESET}"
+        return
+    fi
+
+    # Check if already running in this session
+    for a in "${VALID_ALIASES[@]}"; do
+        if [[ "$a" == "$target" ]]; then
+            echo -e "  ${BYELLOW}⚠  \"${target}\" is already running in this session.${RESET}"
+            return
+        fi
+    done
+
+    load_projects
+
+    if ! is_known_alias "$target"; then
+        echo -e "  ${BRED}✗  Unknown alias: \"${target}\"${RESET}"
+        echo -e "  ${DIM}Use 'add' to add it first, or 'ls' to see configured projects.${RESET}"
+        return
+    fi
+
+    local path
+    path=$(get_project_path "$target")
+    if [[ ! -d "$path" ]]; then
+        echo -e "  ${BRED}✗  Directory not found: ${DIM}${path}${RESET}"
+        return
+    fi
+
+    # Next color after currently running servers
+    local color_idx=${#VALID_ALIASES[@]}
+    local color="${TAG_COLORS[$((color_idx % ${#TAG_COLORS[@]}))]}"
+
+    # Next free port — treat empty port (single-server mode) as BASE_PORT
+    local port=$BASE_PORT
+    for p in "${LAUNCH_PORTS[@]}"; do
+        [[ -z "$p" ]] && p=$BASE_PORT
+        [[ "$p" -ge "$port" ]] && port=$((p + 1))
+    done
+    port=$(next_free_port "$port")
+
+    [[ ${#target} -gt $MAX_ALIAS_LEN ]] && MAX_ALIAS_LEN=${#target}
+    MULTI=1
+
+    echo; print_divider
+    echo -e "  ${color}◆${RESET}  ${BOLD}${target}${RESET}  →  ${BCYAN}http://localhost:${port}${RESET}"
+    printf   "     ${DIM}%s${RESET}\n" "$path"
+    echo -e "  ${GRAY}Launching…${RESET}"
+    print_divider; echo
+
+    launch_server "$target" "$port" "$color"
+    local new_pid=$!
+
+    VALID_ALIASES+=("$target")
+    LAUNCH_PORTS+=("$port")
+    LAUNCH_COLORS+=("$color")
+    PIDS+=("$new_pid")
+}
+
+cmd_list_running() {
+    echo; print_divider
+    echo -e "  ${BOLD}Running servers${RESET}"
+    echo
+    for i in "${!VALID_ALIASES[@]}"; do
+        local alias="${VALID_ALIASES[$i]}"
+        local port="${LAUNCH_PORTS[$i]}"
+        local color="${LAUNCH_COLORS[$i]}"
+        local pid="${PIDS[$i]}"
+        local url
+        [[ -n "$port" ]] && url="http://localhost:${port}" || url="http://localhost:5173"
+        if kill -0 "$pid" 2>/dev/null; then
+            printf "  ${color}●${RESET}  ${BOLD}%-22s${RESET}  ${BCYAN}%-30s${RESET}  ${GRAY}pid %d${RESET}\n" \
+                "$alias" "$url" "$pid"
+        else
+            printf "  ${GRAY}○  %-22s  %-30s  stopped${RESET}\n" "$alias" "$url"
+        fi
+    done
+    echo; print_divider; echo
+}
+
+cmd_help() {
+    echo; print_divider
+    echo -e "  ${BOLD}Commands${RESET}"
+    echo
+    printf "    ${BGREEN}%-26s${RESET}  ${DIM}%s${RESET}\n" "s  ·  stop"     "stop all servers and exit"
+    printf "    ${BGREEN}%-26s${RESET}  ${DIM}%s${RESET}\n" "rs  ·  restart" "restart all servers"
+    printf "    ${BGREEN}%-26s${RESET}  ${DIM}%s${RESET}\n" "r <alias>"      "restart a specific server"
+    printf "    ${BGREEN}%-26s${RESET}  ${DIM}%s${RESET}\n" "run <alias>"    "start a configured project in this session"
+    printf "    ${BGREEN}%-26s${RESET}  ${DIM}%s${RESET}\n" "add"            "add a new project to config"
+    printf "    ${BGREEN}%-26s${RESET}  ${DIM}%s${RESET}\n" "rm <alias>"     "remove a project from config"
+    printf "    ${BGREEN}%-26s${RESET}  ${DIM}%s${RESET}\n" "ls  ·  list"    "show running server statuses"
+    printf "    ${BGREEN}%-26s${RESET}  ${DIM}%s${RESET}\n" "h  ·  help"     "show this message"
+    echo
+    printf "    ${DIM}Full manual: vrun --help${RESET}\n"
+    echo; print_divider; echo
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cleanup trap
+# ════════════════════════════════════════════════════════════════════════════
+
+cleanup() {
+    [[ $CLEANUP_DONE -eq 1 ]] && return
+    CLEANUP_DONE=1
+    [[ ${#PIDS[@]} -eq 0 ]] && return
+    echo; print_divider
+    echo -e "  ${BYELLOW}⚠  Shutting down all servers…${RESET}"
+    for pid in "${PIDS[@]}"; do
+        kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    done
+    wait "${PIDS[@]}" 2>/dev/null || true
+    echo -e "  ${GRAY}All servers stopped.${RESET}"
+    print_divider; echo
+}
+
+trap cleanup INT TERM EXIT
+
+# ════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ════════════════════════════════════════════════════════════════════════════
+
+load_projects
+
+# ── CLI subcommands ──────────────────────────────────────────────────────────
+case "${1:-}" in
+
+    --help|-h|help)
+        print_manual
+        exit 0
+        ;;
+
+    add)
+        print_header
+        cmd_add_project
+        while true; do
+            printf "  Add another project? [y/N]: "
+            IFS= read -r _more < /dev/tty
+            [[ "$_more" != "y" && "$_more" != "Y" ]] && break
+            cmd_add_project
+        done
+        echo -e "  ${BGREEN}✔${RESET}  Config saved →  ${DIM}${CONFIG_FILE}${RESET}"
+        echo
+        exit 0
+        ;;
+
+    rm|remove)
+        shift
+        print_header
+        if [[ $# -eq 0 ]]; then
+            echo -e "  ${BYELLOW}⚠  Usage: vrun rm <alias> [alias2 …]${RESET}"
+            echo
+        else
+            for _t in "$@"; do cmd_remove_project "$_t"; done
+            echo
+        fi
+        exit 0
+        ;;
+
+    ls|list)
+        print_header
+        cmd_list_all_projects
+        exit 0
+        ;;
+
+esac
+
+# ── First-run wizard ─────────────────────────────────────────────────────────
+if [[ ${#KNOWN_ALIASES[@]} -eq 0 ]]; then
+    print_header
+    echo -e "  ${BOLD}Welcome to vrun!${RESET}"
+    echo -e "  No projects configured yet. Let's add your first one."
+    echo
+    cmd_add_project
+    while true; do
+        printf "  Add another project? [y/N]: "
+        IFS= read -r _more < /dev/tty
+        [[ "$_more" != "y" && "$_more" != "Y" ]] && break
+        cmd_add_project
+    done
+    echo -e "  ${BGREEN}✔${RESET}  All set. Start a server with: ${BOLD}vrun <alias>${RESET}"
+    echo
+    exit 0
+fi
+
+# ── No arguments — print usage ───────────────────────────────────────────────
+if [[ $# -eq 0 ]]; then
+    print_header
+    echo -e "  ${BRED}✗  No alias provided.${RESET}"
+    echo
+    echo -e "  ${BOLD}Usage${RESET}"
+    echo
+    printf "    ${BGREEN}%-30s${RESET}  %s\n" "vrun <alias> [alias2 …]" "start servers"
+    printf "    ${BGREEN}%-30s${RESET}  %s\n" "vrun add"                "add a project"
+    printf "    ${BGREEN}%-30s${RESET}  %s\n" "vrun rm <alias>"         "remove a project"
+    printf "    ${BGREEN}%-30s${RESET}  %s\n" "vrun ls"                 "list projects"
+    printf "    ${BGREEN}%-30s${RESET}  %s\n" "vrun --help"             "full manual"
+    echo
+    cmd_list_all_projects
+    exit 1
+fi
+
+# ── Validate aliases ─────────────────────────────────────────────────────────
+SEEN=()
+for _arg in "$@"; do
+    _dup=0
+    for s in "${SEEN[@]:-}"; do
+        if [[ "$s" == "$_arg" ]]; then
+            echo -e "  ${BYELLOW}⚠  Duplicate \"${_arg}\" — skipping.${RESET}"
+            _dup=1; break
+        fi
+    done
+    [[ $_dup -eq 1 ]] && continue
+
+    path=$(get_project_path "$_arg")
+    if [[ -z "$path" ]]; then
+        print_header
+        echo -e "  ${BRED}✗  Unknown alias: \"${_arg}\"${RESET}"
+        echo -e "  ${DIM}Run 'vrun ls' to see projects, 'vrun add' to add one.${RESET}"
+        echo
+        exit 1
+    fi
+
+    SEEN+=("$_arg")
+    VALID_ALIASES+=("$_arg")
+done
+
+# ── Print header + launch plan ───────────────────────────────────────────────
+print_header
+
+MULTI=0
+[[ ${#VALID_ALIASES[@]} -gt 1 ]] && MULTI=1
+
+for _arg in "${VALID_ALIASES[@]}"; do
+    [[ ${#_arg} -gt $MAX_ALIAS_LEN ]] && MAX_ALIAS_LEN=${#_arg}
+done
+
+local_count=${#VALID_ALIASES[@]}
+[[ $local_count -eq 1 ]] \
+    && echo -e "  ${BOLD}Launching 1 server${RESET}" \
+    || echo -e "  ${BOLD}Launching ${local_count} servers${RESET}"
+echo
+
+CURRENT_PORT=$BASE_PORT
+COLOR_IDX=0
+
+for _arg in "${VALID_ALIASES[@]}"; do
+    alias="$_arg"
+    path=$(get_project_path "$alias")
+    color="${TAG_COLORS[$((COLOR_IDX % ${#TAG_COLORS[@]}))]}"
+
+    if [[ ! -d "$path" ]]; then
+        echo -e "  ${BRED}✗  Directory not found for \"${alias}\":${RESET}"
+        echo -e "     ${DIM}${path}${RESET}"
+        echo
+        exit 1
+    fi
+
+    if [[ $MULTI -eq 1 ]]; then
+        CURRENT_PORT=$(next_free_port "$CURRENT_PORT")
+        url="http://localhost:${CURRENT_PORT}"
+        LAUNCH_PORTS+=("$CURRENT_PORT")
+        CURRENT_PORT=$((CURRENT_PORT + 1))
+    else
+        url="http://localhost:5173"
+        LAUNCH_PORTS+=("")
+    fi
+
+    LAUNCH_COLORS+=("$color")
+    printf "  ${color}◆${RESET}  ${BOLD}%-22s${RESET}  ${BCYAN}%s${RESET}\n" "$alias" "$url"
+    printf "     ${DIM}%s${RESET}\n" "$path"
+    echo
+    COLOR_IDX=$((COLOR_IDX + 1))
+done
+
+# ── Launch all servers ───────────────────────────────────────────────────────
+for i in "${!VALID_ALIASES[@]}"; do
+    launch_server "${VALID_ALIASES[$i]}" "${LAUNCH_PORTS[$i]}" "${LAUNCH_COLORS[$i]}"
+    PIDS[$i]=$!
+done
+
+print_commands_bar
+echo
+
+# ── Interactive command loop ─────────────────────────────────────────────────
+while IFS= read -r cmd; do
+    cmd="$(echo "$cmd" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    case "$cmd" in
+        s|stop|q|quit)
+            cmd_stop; exit 0
+            ;;
+        rs|restart)
+            cmd_restart_all
+            ;;
+        r\ *)
+            cmd_restart_one "${cmd#r }"
+            ;;
+        r)
+            echo -e "  ${BYELLOW}⚠  Usage: r <alias>  (e.g. r innoflow)${RESET}"
+            ;;
+        add)
+            cmd_add_project
+            printf "  Launch it now? [y/N]: "
+            IFS= read -r _launch < /dev/tty
+            if [[ "$_launch" == "y" || "$_launch" == "Y" ]]; then
+                cmd_run_project "$LAST_ADDED_ALIAS"
+            else
+                echo -e "  ${DIM}Use 'run ${LAST_ADDED_ALIAS}' to start it anytime.${RESET}"
+                echo
+            fi
+            ;;
+        run\ *)
+            cmd_run_project "${cmd#run }"
+            ;;
+        run)
+            echo -e "  ${BYELLOW}⚠  Usage: run <alias>  (e.g. run innoflow)${RESET}"
+            ;;
+        rm\ *)
+            load_projects
+            cmd_remove_project "${cmd#rm }"
+            ;;
+        rm)
+            echo -e "  ${BYELLOW}⚠  Usage: rm <alias>  (e.g. rm innoflow)${RESET}"
+            ;;
+        ls|list)
+            cmd_list_running
+            ;;
+        h|help|'?')
+            cmd_help
+            ;;
+        '')
+            ;;
+        *)
+            echo -e "  ${BYELLOW}⚠  Unknown: \"${cmd}\"  ${DIM}— type 'h' for help${RESET}"
+            ;;
+    esac
+done
